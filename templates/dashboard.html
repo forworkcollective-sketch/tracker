@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trigger Tracker</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+    <link rel="stylesheet" href="/static/webapp/styles.css">
+    <style>
+        /* Dashboard overrides for wider layout */
+        .app { max-width: 1100px; padding-bottom: 40px; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+        .grid-full { grid-column: 1 / -1; }
+        .bottom-nav { display: none; }
+        @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <div class="header">
+            <h1>TRIGGER TRACKER</h1>
+            <div class="subtitle">{{ today }} // 4h focus protocol</div>
+        </div>
+
+        <div class="grid">
+            <!-- Timer Hero — HUD Display -->
+            <div class="card scanline">
+                <div class="hud-timer">
+                    <div class="streak-badge">
+                        <span class="streak-fire">&#x1F525;</span>
+                        <span class="streak-number">{{ streak }}</span>
+                        <span class="streak-label">
+                            {% if streak == 0 %}Start!{% elif streak < 7 %}{{ 7 - streak }} to weekly{% elif streak < 30 %}{{ 30 - streak }} to monthly{% else %}Power!{% endif %}
+                        </span>
+                    </div>
+
+                    <div class="hud-time-display">
+                        <div class="hud-digits">
+                            {{ (worked_today // 60)|int }}<span class="sep">:</span>{{ "%02d"|format((worked_today % 60)|int) }}
+                        </div>
+                        <div class="hud-sub">of {{ (budget // 60)|int }}h today</div>
+                        <div class="hud-remaining">{{ ((budget - worked_today) // 60)|int }}h {{ ((budget - worked_today) % 60)|int }}m remaining</div>
+                    </div>
+
+                    {% set pct = ((worked_today / budget * 100)|round|int) %}
+                    <div class="hud-progress-wrap">
+                        <div class="hud-progress-track">
+                            <div class="hud-progress-fill" style="width: {{ pct }}%"></div>
+                        </div>
+                        <div class="hud-progress-labels">
+                            <span>0h</span><span>1h</span><span>2h</span><span>3h</span><span>4h</span>
+                        </div>
+                        <div class="hud-pct">{{ pct }}%</div>
+                    </div>
+
+                    {% if active_timer %}
+                    <div class="active-task-hud scanline">
+                        <div class="active-indicator">
+                            <div class="pulse-dot"></div>
+                            <span class="active-label">Recording</span>
+                        </div>
+                        <div class="active-task-name">{{ active_timer.task_title }}</div>
+                        <div class="active-task-goal">{{ active_timer.goal_title or '' }}</div>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+
+            <!-- Tasks Today -->
+            <div class="card">
+                <div class="card-title">Today's Tasks</div>
+                {% for t in tasks_today %}
+                <div class="task-card {{ 'is-active' if t.status == 'in_progress' else 'is-done' if t.status == 'done' else '' }}">
+                    <div class="task-status-icon {{ 'done' if t.status == 'done' else 'running' if t.status == 'in_progress' else 'todo' }}">
+                        {% if t.status == 'done' %}&#x2713;{% elif t.status == 'in_progress' %}&#x25B6;{% else %}&#x25CB;{% endif %}
+                    </div>
+                    <div class="task-body">
+                        <div class="task-name {{ 'done-text' if t.status == 'done' }}">{{ t.title }}</div>
+                        <div class="task-goal-label">{{ t.goal_title or '' }}</div>
+                    </div>
+                    <span class="task-est">{{ t.estimate_min }}m</span>
+                </div>
+                {% endfor %}
+                {% if not tasks_today %}
+                <div class="empty-state">
+                    <div class="empty-text">No tasks. Bot will suggest a plan at 9:00</div>
+                </div>
+                {% endif %}
+            </div>
+
+            <!-- Life Goals Zones -->
+            <div class="card grid-full">
+                <div class="card-title">Life Goals</div>
+                <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;">
+                {% for z in zones %}
+                <div class="zone-card" style="border-left-color: {{ z.color }};">
+                    <div class="zone-header">
+                        <span class="zone-title">{{ z.title }}</span>
+                        <span class="zone-pct" style="color: {{ z.color }};">{{ z.pct }}%</span>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: {{ z.pct }}%; background: {{ z.color }};"></div>
+                    </div>
+                    <div class="zone-stats">
+                        {% if z.total_target > 0 %}
+                        <span>{{ "{:,}".format(z.total_target).replace(',', ' ') }}&#x20BD;</span>
+                        <span>Left: <b style="color:var(--text)">{{ "{:,}".format(z.total_remaining).replace(',', ' ') }}&#x20BD;</b></span>
+                        {% endif %}
+                        {% if z.total_monthly > 0 %}
+                        <span>{{ "{:,}".format(z.total_monthly).replace(',', ' ') }}&#x20BD;/mo</span>
+                        {% endif %}
+                    </div>
+                    <details>
+                        <summary style="cursor:pointer;font-size:11px;color:var(--text-muted);padding:4px 0;">{{ z.count }} items &rarr;</summary>
+                        {% for g in z.goals_list %}
+                        <div class="zone-detail-item">
+                            <div class="zone-detail-head">
+                                <span>{{ g.emoji }} {{ g.title }}</span>
+                                {% if g.target_rub > 0 %}<span style="color:{{ z.color }}">{{ g.pct }}%</span>
+                                {% elif g.monthly_rub > 0 %}<span>{{ "{:,}".format(g.monthly_rub).replace(',', ' ') }}&#x20BD;/mo</span>{% endif %}
+                            </div>
+                            {% if g.target_rub > 0 %}
+                            <div class="zone-detail-bar"><div style="width:{{ g.pct }}%;background:{{ z.color }}"></div></div>
+                            <div class="zone-detail-meta">{{ "{:,}".format(g.paid_rub or 0).replace(',', ' ') }} / {{ "{:,}".format(g.target_rub).replace(',', ' ') }}&#x20BD;</div>
+                            {% endif %}
+                        </div>
+                        {% endfor %}
+                    </details>
+                </div>
+                {% endfor %}
+                </div>
+            </div>
+
+            <!-- Work Goals -->
+            <div class="card grid-full">
+                <div class="card-title">Work Goals</div>
+                {% for g in goals %}
+                <div class="goal-item">
+                    <div class="goal-header">
+                        <span class="goal-name">{{ g.title }}</span>
+                        <span class="goal-pct">{{ g.pct }}%</span>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: {{ g.pct }}%; background: {{ g.color or 'var(--burg-light)' }};"></div>
+                    </div>
+                    <div class="goal-meta">
+                        <span>{{ g.done_tasks }}/{{ g.total_tasks }} tasks</span>
+                        <span>{{ g.hours_spent }}h worked</span>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+
+            <!-- Daily Chart -->
+            <div class="card">
+                <div class="card-title">Hours (30 days)</div>
+                <div class="chart-wrap"><canvas id="dailyChart"></canvas></div>
+            </div>
+
+            <!-- Goal Distribution -->
+            <div class="card">
+                <div class="card-title">Time by Goal</div>
+                <div class="chart-wrap"><canvas id="goalChart"></canvas></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const dailyStats = {{ daily_stats|safe }};
+        const timeByGoal = {{ time_by_goal|safe }};
+
+        if (dailyStats.length > 0) {
+            new Chart(document.getElementById('dailyChart'), {
+                type: 'bar',
+                data: {
+                    labels: dailyStats.map(d => d.day.slice(5)),
+                    datasets: [{
+                        data: dailyStats.map(d => +(d.total_min / 60).toFixed(1)),
+                        backgroundColor: dailyStats.map(d =>
+                            d.total_min >= 240 ? 'rgba(94,224,160,0.5)' :
+                            d.total_min >= 120 ? 'rgba(212,54,79,0.5)' :
+                            'rgba(255,248,240,0.08)'
+                        ),
+                        borderRadius: 4, barThickness: 10,
+                    }]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ctx.raw + 'h' } } },
+                    scales: {
+                        y: { beginAtZero: true, max: 6, grid: { color: 'rgba(255,248,240,0.03)' },
+                            ticks: { color: '#6B5545', callback: v => v + 'h', font: { family: 'JetBrains Mono', size: 10 } } },
+                        x: { grid: { display: false }, ticks: { color: '#6B5545', font: { family: 'JetBrains Mono', size: 9 } } }
+                    }
+                }
+            });
+        }
+        if (timeByGoal.length > 0) {
+            new Chart(document.getElementById('goalChart'), {
+                type: 'doughnut',
+                data: {
+                    labels: timeByGoal.map(g => g.title),
+                    datasets: [{ data: timeByGoal.map(g => +(g.total_min / 60).toFixed(1)),
+                        backgroundColor: timeByGoal.map(g => g.color || '#9B1B30'), borderWidth: 0, spacing: 3 }]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false, cutout: '65%',
+                    plugins: { legend: { position: 'right', labels: { color: '#FFF5EB', padding: 10, font: { family: 'Rajdhani', size: 12 } } },
+                        tooltip: { callbacks: { label: ctx => ctx.label + ': ' + ctx.raw + 'h' } } }
+                }
+            });
+        }
+    </script>
+</body>
+</html>

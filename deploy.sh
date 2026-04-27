@@ -4,7 +4,7 @@ set -e
 echo "=== TRACKER DEPLOY ==="
 
 # 1. System packages
-apt update && apt install -y python3.11 python3.11-venv python3-pip nginx git
+apt update && apt install -y python3 python3-venv python3-pip nginx git
 
 # 2. Clone repo
 rm -rf /opt/tracker
@@ -21,7 +21,7 @@ WEB_PORT=8099
 ENVEOF
 
 # 4. Python venv + deps
-python3.11 -m venv /opt/tracker/venv
+python3 -m venv /opt/tracker/venv
 /opt/tracker/venv/bin/pip install --upgrade pip
 /opt/tracker/venv/bin/pip install -r /opt/tracker/requirements.txt
 /opt/tracker/venv/bin/pip install python-dotenv

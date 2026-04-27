@@ -1,0 +1,12 @@
+[
+  {"id": 1, "phase": "autopilot", "title": "Определить формат агентства", "start_date": "2026-05-01", "end_date": "2026-05-31", "color": "#6366f1", "status": "todo", "priority": 1},
+  {"id": 2, "phase": "autopilot", "title": "Первые 3 клиента на новой модели", "start_date": "2026-06-01", "end_date": "2026-06-30", "color": "#8b5cf6", "status": "todo", "priority": 2},
+  {"id": 3, "phase": "autopilot", "title": "Автоматизация привлечения", "start_date": "2026-07-01", "end_date": "2026-07-31", "color": "#ec4899", "status": "todo", "priority": 3},
+  {"id": 4, "phase": "autopilot", "title": "Делегирование продаж и реализации", "start_date": "2026-08-01", "end_date": "2026-08-31", "color": "#f59e0b", "status": "todo", "priority": 4},
+  {"id": 5, "phase": "autopilot", "title": "500к/мес на автопилоте", "start_date": "2026-09-01", "end_date": "2026-09-30", "color": "#10b981", "status": "todo", "priority": 5},
+  {"id": 6, "phase": "freedom", "title": "Закрыть все долги", "start_date": "2026-10-01", "end_date": "2026-11-15", "color": "#dc2626", "status": "todo", "priority": 6},
+  {"id": 7, "phase": "freedom", "title": "Подушка + хотелки", "start_date": "2026-11-01", "end_date": "2026-12-31", "color": "#16a34a", "status": "todo", "priority": 7},
+  {"id": 8, "phase": "media", "title": "Запуск медийного проекта", "start_date": "2027-01-01", "end_date": "2027-03-31", "color": "#D4A574", "status": "todo", "priority": 8},
+  {"id": 9, "phase": "learning", "title": "Кештаун", "start_date": "2026-05-01", "end_date": "2026-12-31", "color": "#60D0E0", "status": "todo", "priority": 9},
+  {"id": 10, "phase": "learning", "title": "Разработка / вайбкодинг", "start_date": "2026-05-01", "end_date": "2026-12-31", "color": "#5EE0A0", "status": "todo", "priority": 10}
+]

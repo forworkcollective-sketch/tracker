@@ -1,1211 +1,1047 @@
 """
-Trigger Tracker — Telegram Bot
-Трекер продуктивности: 4 часа в день на цели
+ФОКУС-ТРЕКЕР v2 — Telegram Bot
+python-telegram-bot (v20+), async handlers, Moscow timezone
 """
-import asyncio
 import logging
-import re
-from datetime import date, datetime
+from datetime import date, datetime, time as dtime, timezone, timedelta
+
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton, BotCommand,
-    MenuButtonWebApp, WebAppInfo,
+    ReplyKeyboardMarkup, WebAppInfo,
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes
+    MessageHandler, ContextTypes, ConversationHandler, filters,
 )
+from telegram.constants import ParseMode
 
 from config import BOT_TOKEN, OWNER_ID, DAILY_BUDGET_MINUTES, WEB_PORT
 import db
 import motivation
 import autotasks
 
+logging.basicConfig(
+    format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("bot")
+
+MSK = timezone(timedelta(hours=3))
 WEBAPP_URL = f"http://localhost:{WEB_PORT}"
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+POMODORO_MIN = 30
 
 
-# ===== HELPERS =====
+# ═══════════════════════════════════════════
+# HELPER FUNCTIONS
+# ═══════════════════════════════════════════
 
-def fmt_minutes(mins):
-    """Форматирует минуты в 'Xч Yмин'"""
-    h = int(mins // 60)
-    m = int(mins % 60)
+def fmt_minutes(mins: float) -> str:
+    mins = round(mins)
+    h, m = divmod(mins, 60)
     if h and m:
         return f"{h}ч {m}мин"
-    elif h:
+    if h:
         return f"{h}ч"
     return f"{m}мин"
 
-def progress_bar(current, total, length=10):
-    """Визуальный прогресс-бар"""
+
+def progress_bar(current: float, total: float, length: int = 10) -> str:
     if total <= 0:
         return "░" * length
-    filled = int(min(current / total, 1.0) * length)
+    filled = int(round(current / total * length))
+    filled = min(filled, length)
     return "▓" * filled + "░" * (length - filled)
 
+
+def fmt_rub(n: float) -> str:
+    n = int(round(n))
+    s = f"{abs(n):,}".replace(",", " ")
+    return f"{'-' if n < 0 else ''}{s}₽"
+
+
 def is_owner(update: Update) -> bool:
-    return update.effective_user.id == OWNER_ID
+    return update.effective_user and update.effective_user.id == OWNER_ID
 
 
-# ===== GOAL MATCHING =====
-
-# Карта ключевых слов → паттерны для автоматического определения цели
-# Расширяемый словарь: слова из текста пользователя → слова из названий целей
-KEYWORD_SYNONYMS = {
-    "пост": ["контент", "контентн", "smm", "соцсет", "блог", "канал", "telegram", "тг", "инстаграм", "instagram"],
-    "контент": ["контент", "контентн", "smm", "соцсет", "блог", "канал", "воронк"],
-    "канал": ["контент", "канал", "telegram", "тг", "блог"],
-    "тг": ["контент", "канал", "telegram", "тг"],
-    "рилс": ["контент", "smm", "видео", "reels"],
-    "видео": ["контент", "видео", "reels", "монтаж"],
-    "оффер": ["оффер", "продаж", "клиент", "лид", "лидген", "воронк", "продукт"],
-    "клиент": ["клиент", "продаж", "лид", "лидген", "crm"],
-    "лид": ["лид", "лидген", "клиент", "продаж", "воронк"],
-    "продаж": ["продаж", "клиент", "лид", "revenue"],
-    "сайт": ["сайт", "лендинг", "landing", "web", "веб"],
-    "лендинг": ["сайт", "лендинг", "landing", "web"],
-    "дизайн": ["дизайн", "креатив", "баннер", "визуал"],
-    "креатив": ["креатив", "дизайн", "баннер", "контент"],
-    "бот": ["бот", "автоматизац", "n8n", "telegram"],
-    "автоматизац": ["автоматизац", "бот", "n8n", "скрипт"],
-    "реклам": ["реклам", "трафик", "таргет", "ads", "маркетинг"],
-    "таргет": ["таргет", "реклам", "трафик", "ads"],
-    "трафик": ["трафик", "реклам", "таргет", "ads"],
-    "аналитик": ["аналитик", "данн", "отчет", "метрик", "dashboard"],
-    "отчет": ["отчет", "аналитик", "данн", "report"],
-    "стратег": ["стратег", "план", "roadmap"],
-    "план": ["план", "стратег", "roadmap"],
-    "долг": ["долг", "кредит", "платеж", "финанс"],
-    "кредит": ["долг", "кредит", "платеж"],
-    "финанс": ["финанс", "бюджет", "деньг", "долг"],
-    "рассылк": ["рассылк", "email", "письм", "контент"],
-    "письм": ["письм", "рассылк", "email", "контент"],
-    "презентац": ["презентац", "pitch", "предложен", "оффер"],
-    "код": ["код", "разработк", "программ", "dev"],
-    "разработк": ["разработк", "код", "программ", "dev"],
-}
-
-def match_goal_by_text(text: str) -> dict | None:
-    """
-    Пытается найти подходящую цель по тексту пользователя.
-    Использует нечёткое совпадение ключевых слов.
-    Возвращает goal dict или None.
-    """
-    goals = db.get_goals(goal_type="work")
-    if not goals:
-        return None
-
-    text_lower = text.lower()
-    text_words = re.findall(r'[а-яёa-z0-9]+', text_lower)
-
-    best_goal = None
-    best_score = 0
-
-    for goal in goals:
-        goal_title_lower = goal['title'].lower()
-        goal_words = re.findall(r'[а-яёa-z0-9]+', goal_title_lower)
-        score = 0
-
-        # Прямое совпадение слов текста с названием цели
-        for word in text_words:
-            if len(word) < 3:
-                continue
-            for gw in goal_words:
-                # Стемминг-лайт: совпадение начала слова (мин 4 символа)
-                min_len = min(len(word), len(gw), 4)
-                if word[:min_len] == gw[:min_len]:
-                    score += 3
-                    break
-
-        # Расширенное совпадение через синонимы
-        for word in text_words:
-            if len(word) < 3:
-                continue
-            # Ищем синонимы для слова из текста
-            for syn_key, syn_values in KEYWORD_SYNONYMS.items():
-                if word.startswith(syn_key[:3]) or syn_key.startswith(word[:3]):
-                    # Нашли синоним-ключ, теперь проверяем значения vs цель
-                    for sv in syn_values:
-                        for gw in goal_words:
-                            if gw.startswith(sv[:3]) or sv.startswith(gw[:3]):
-                                score += 1
-                                break
-
-        if score > best_score:
-            best_score = score
-            best_goal = goal
-
-    # Минимальный порог совпадения
-    if best_score >= 2:
-        return best_goal
-    return None
+def today_str() -> str:
+    return date.today().isoformat()
 
 
-# Слова для быстрой остановки таймера
-STOP_WORDS = {"стоп", "stop", "готово", "done", "пауза", "pause", "хватит", "всё", "все", "финиш"}
-
+# ═══════════════════════════════════════════
+# PERSISTENT REPLY KEYBOARD
+# ═══════════════════════════════════════════
 
 MAIN_KB = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("📋 План на 4ч"), KeyboardButton("▶️ Статус")],
-        [KeyboardButton("✅ Завершить"), KeyboardButton("📊 Сегодня")],
-        [KeyboardButton("🎯 Работа"), KeyboardButton("💼 Жизнь")],
-        [KeyboardButton("🔥 Streak"), KeyboardButton("💡 Предложи план")],
+        ["📋 План", "▶ Фокус", "✅ Готово"],
+        ["🎁 Награды", "🎯 Цели", "💰 Долги"],
+        ["📈 Продажи", "📊 Статы"],
     ],
     resize_keyboard=True,
-    is_persistent=True,
 )
 
 
-# ===== COMMANDS =====
+# ═══════════════════════════════════════════
+# BUILD DEBTS INLINE (no web.py dependency)
+# ═══════════════════════════════════════════
+
+def build_debts():
+    debts = db.get_all_financial_goals()
+    total_target = sum(d.get("target_rub") or 0 for d in debts)
+    total_paid = sum(d.get("paid_rub") or 0 for d in debts)
+    for d in debts:
+        t = d.get("target_rub") or 0
+        p = d.get("paid_rub") or 0
+        d["pct"] = int(p / t * 100) if t > 0 else 0
+        d["remaining"] = max(t - p, 0)
+    return {
+        "items": debts,
+        "total_target": total_target,
+        "total_paid": total_paid,
+        "total_remaining": max(total_target - total_paid, 0),
+        "pct": int(total_paid / total_target * 100) if total_target > 0 else 0,
+    }
+
+
+# ═══════════════════════════════════════════
+# COMMAND: /start
+# ═══════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
-        return await update.message.reply_text("⛔ Этот бот — личный трекер.")
+        return await update.message.reply_text("Бот только для владельца.")
+
+    mins = db.get_today_minutes()
+    streak = db.get_streak()
+    xp = db.get_xp()
+    pomos = db.get_today_pomodoros()
+
+    text = (
+        "Привет! Я — Фокус-Трекер.\n\n"
+        f"Сегодня: {fmt_minutes(mins)} / {fmt_minutes(DAILY_BUDGET_MINUTES)}\n"
+        f"{progress_bar(mins, DAILY_BUDGET_MINUTES)} {int(mins / max(DAILY_BUDGET_MINUTES, 1) * 100)}%\n\n"
+        f"🍅 Помодорок: {pomos}/8\n"
+        f"🔥 Стрик: {streak} дн.\n"
+        f"⭐ XP: {xp['total_xp']} (ур. {xp['level']})\n\n"
+        "Жми /plan чтобы увидеть план дня."
+    )
+    await update.message.reply_text(text, reply_markup=MAIN_KB)
+
+
+# ═══════════════════════════════════════════
+# COMMAND: /plan
+# ═══════════════════════════════════════════
+
+async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+
+    tasks = db.get_tasks_for_date(today_str())
+    mins = db.get_today_minutes()
+    schedule = db.get_today_schedule()
+    active = db.get_active_timer()
+
+    focus_text = schedule.get("focus", "Свободный день")
+    weekday_idx = date.today().weekday()
+    day_name = db.DAYS_RU[weekday_idx]
+
+    lines = [f"📋 <b>План на сегодня</b> ({day_name} — {focus_text})"]
+    lines.append(f"⏱ {fmt_minutes(mins)} / {fmt_minutes(DAILY_BUDGET_MINUTES)}  {progress_bar(mins, DAILY_BUDGET_MINUTES)}")
+    lines.append("")
+
+    if not tasks:
+        lines.append("Задач пока нет. Жми «Сгенерировать план» или /add")
+        kb = [[InlineKeyboardButton("🤖 Сгенерировать план", callback_data="autoplan")]]
+    else:
+        kb = []
+        for i, t in enumerate(tasks, 1):
+            emoji = t.get("goal_emoji", "🎯")
+            status_icon = "✅" if t["status"] == "done" else ("⏳" if t["status"] == "in_progress" else "⬜")
+            lines.append(
+                f"{status_icon} {emoji} <b>{t['title']}</b> ({fmt_minutes(t['estimate_min'])})"
+            )
+            if t["status"] not in ("done",):
+                kb.append([InlineKeyboardButton(
+                    f"▶ {t['title'][:30]}",
+                    callback_data=f"start_{t['id']}"
+                )])
+
+        est_total = sum(t["estimate_min"] for t in tasks)
+        done_count = sum(1 for t in tasks if t["status"] == "done")
+        lines.append(f"\nИтого: {len(tasks)} задач на ~{fmt_minutes(est_total)} | Выполнено: {done_count}")
+
+    if active:
+        lines.append(f"\n🔴 Сейчас: {active['task_title']}")
+
+    kb.append([InlineKeyboardButton("✏ Открыть WebApp", web_app=WebAppInfo(url=WEBAPP_URL))])
 
     await update.message.reply_text(
-        "🎯 *Trigger Tracker*\n\n"
-        "4 часа в день — на то, что ведёт к цели.\n\n"
-        "Жми кнопки внизу или 📋 слева от поля ввода.\n\n"
-        "💬 Или просто напиши чем занимаешься — я запущу таймер.\n"
-        "Напиши «стоп» когда закончишь.",
-        parse_mode="Markdown",
-        reply_markup=MAIN_KB,
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(kb),
     )
 
 
-async def handle_reply_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатия по reply-клавиатуре"""
+# ═══════════════════════════════════════════
+# COMMAND: /focus — start pomodoro
+# ═══════════════════════════════════════════
+
+async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
-    text = update.message.text
-    mapping = {
-        "📋 План на 4ч":      cmd_plan,
-        "▶️ Статус":           cmd_status,
-        "✅ Завершить":        cmd_done,
-        "📊 Сегодня":          cmd_today,
-        "🎯 Работа":           cmd_goals,
-        "💼 Жизнь":            cmd_life,
-        "🔥 Streak":           cmd_streak,
-        "💡 Предложи план":    cmd_suggest,
-    }
-    handler = mapping.get(text)
-    if handler:
-        await handler(update, context)
-        return True  # Обработано как кнопка
-    return False  # Не кнопка — пусть обрабатывает free_text
+
+    # Check if already running
+    active = db.get_active_timer()
+    if active:
+        started = datetime.fromisoformat(active["started_at"])
+        elapsed = (datetime.now() - started).total_seconds() / 60
+        await update.message.reply_text(
+            f"🔴 Таймер уже запущен!\n"
+            f"Задача: <b>{active['task_title']}</b>\n"
+            f"Прошло: {fmt_minutes(elapsed)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏹ Остановить", callback_data="stop_timer")],
+                [InlineKeyboardButton("✅ Завершить задачу", callback_data=f"done_{active['task_id']}")],
+            ]),
+        )
+        return
+
+    # Budget check
+    mins = db.get_today_minutes()
+    if mins >= DAILY_BUDGET_MINUTES:
+        await update.message.reply_text(
+            f"🎉 Ты уже отработал {fmt_minutes(mins)} сегодня!\n"
+            "Бюджет на сегодня выполнен. Отдохни!"
+        )
+        return
+
+    # Show task picker
+    tasks = db.get_tasks_for_date(today_str())
+    todo = [t for t in tasks if t["status"] in ("todo", "in_progress")]
+    if not todo:
+        await update.message.reply_text(
+            "Нет запланированных задач. Используй /plan или /add"
+        )
+        return
+
+    kb = []
+    for t in todo:
+        emoji = t.get("goal_emoji", "🎯")
+        kb.append([InlineKeyboardButton(
+            f"{emoji} {t['title'][:40]}",
+            callback_data=f"start_{t['id']}"
+        )])
+
+    await update.message.reply_text(
+        "🍅 <b>Выбери задачу для помодорки (30 мин):</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+
+# ═══════════════════════════════════════════
+# COMMAND: /done — complete current task
+# ═══════════════════════════════════════════
+
+async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+
+    active = db.get_active_timer()
+    if not active:
+        # Show today's in-progress tasks
+        tasks = db.get_tasks_for_date(today_str())
+        in_progress = [t for t in tasks if t["status"] == "in_progress"]
+        if not in_progress:
+            await update.message.reply_text("Нет активных задач. Запусти /focus")
+            return
+        kb = [[InlineKeyboardButton(
+            f"✅ {t['title'][:35]}",
+            callback_data=f"done_{t['id']}"
+        )] for t in in_progress]
+        await update.message.reply_text(
+            "Какую задачу завершить?",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return
+
+    task_id = active["task_id"]
+    await _complete_task(update, context, task_id)
+
+
+async def _complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int):
+    """Complete task + stop timer + award XP"""
+    duration = db.stop_active_timer()
+    db.complete_task(task_id)
+    task = db.get_task(task_id)
+    task_title = task["title"] if task else "Задача"
+
+    # XP for task
+    xp_earned = db.XP_TASK_DONE
+    db.add_xp(db.XP_TASK_DONE, "task_done")
+
+    # XP for pomodoro if duration >= 25min
+    if duration >= 25:
+        pomo_count = max(int(duration // 30), 1)
+        pomo_xp = pomo_count * db.XP_POMODORO
+        db.add_xp(pomo_xp, "pomodoro")
+        xp_earned += pomo_xp
+
+    # Check bonuses
+    bonus = 0
+    today_min = db.get_today_minutes()
+    if today_min >= DAILY_BUDGET_MINUTES:
+        bonus += db.XP_FULL_DAY
+
+    today_tasks = db.get_tasks_for_date(today_str())
+    if today_tasks and all(t["status"] == "done" for t in today_tasks):
+        bonus += db.XP_ALL_TASKS
+
+    if bonus:
+        db.add_xp(bonus, "bonus")
+        xp_earned += bonus
+
+    xp = db.get_xp()
+    quote = motivation.get_done_quote()
+
+    lines = [
+        f"✅ <b>{task_title}</b> — выполнена!",
+        f"⏱ Затрачено: {fmt_minutes(duration)}",
+        f"⭐ +{xp_earned} XP (всего: {xp['total_xp']}, ур. {xp['level']})",
+    ]
+    if bonus:
+        if today_min >= DAILY_BUDGET_MINUTES:
+            lines.append(f"🏆 +{db.XP_FULL_DAY} XP бонус за 4ч!")
+        if today_tasks and all(t["status"] == "done" for t in today_tasks):
+            lines.append(f"🌟 +{db.XP_ALL_TASKS} XP бонус за все задачи дня!")
+    lines.append(f"\n💬 {quote}")
+
+    # Rewards hint
+    rewards = db.get_rewards()
+    affordable = [r for r in rewards if r["cost_xp"] <= xp["total_xp"]]
+    if affordable:
+        lines.append(f"\n🎁 Доступно наград: {len(affordable)} — /rewards")
+
+    msg = update.message or update.callback_query.message
+    await msg.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_KB,
+    )
+
+    # Check if 4h reached — instant summary
+    if today_min >= DAILY_BUDGET_MINUTES:
+        await _send_4h_summary(context, update.effective_chat.id)
+
+
+async def _send_4h_summary(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Congrats message when 4h reached"""
+    mins = db.get_today_minutes()
+    pomos = db.get_today_pomodoros()
+    streak = db.get_streak()
+    xp = db.get_xp()
+    tasks = db.get_tasks_for_date(today_str())
+    done_count = sum(1 for t in tasks if t["status"] == "done")
+
+    text = (
+        "🎉🎉🎉 <b>4 ЧАСА ВЫПОЛНЕНЫ!</b> 🎉🎉🎉\n\n"
+        f"⏱ Отработано: {fmt_minutes(mins)}\n"
+        f"🍅 Помодорок: {pomos}\n"
+        f"✅ Задач: {done_count}/{len(tasks)}\n"
+        f"🔥 Стрик: {streak} дн.\n"
+        f"⭐ XP: {xp['total_xp']} (ур. {xp['level']})\n\n"
+        "Ты — машина. Отдохни и наслаждайся вечером!"
+    )
+    photo = motivation.get_image("day_complete")
+    try:
+        await context.bot.send_photo(chat_id=chat_id, photo=photo, caption=text, parse_mode=ParseMode.HTML)
+    except Exception:
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+
+
+# ═══════════════════════════════════════════
+# COMMAND: /rewards
+# ═══════════════════════════════════════════
+
+async def cmd_rewards(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+
+    rewards = db.get_rewards()
+    xp = db.get_xp()
+
+    lines = [
+        f"🎁 <b>Каталог наград</b>",
+        f"⭐ Твой баланс: {xp['total_xp']} XP (ур. {xp['level']})\n",
+    ]
+
+    kb = []
+    if not rewards:
+        lines.append("Каталог пуст. Добавь награды через WebApp.")
+    else:
+        for r in rewards:
+            can = "✅" if xp["total_xp"] >= r["cost_xp"] else "🔒"
+            lines.append(f"{can} {r.get('emoji', '🎁')} <b>{r['title']}</b> — {r['cost_xp']} XP")
+            if xp["total_xp"] >= r["cost_xp"]:
+                kb.append([InlineKeyboardButton(
+                    f"🎁 Забрать: {r['title'][:30]}",
+                    callback_data=f"claim_{r['id']}"
+                )])
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(kb) if kb else MAIN_KB,
+    )
+
+
+# ═══════════════════════════════════════════
+# COMMAND: /goals
+# ═══════════════════════════════════════════
 
 async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
+
     goals = db.get_goals(goal_type="work")
-    if not goals:
-        return await update.message.reply_text("Рабочих целей нет. /addgoal чтобы добавить.")
+    lines = ["🎯 <b>Рабочие цели</b>\n"]
 
-    lines = ["🎯 *Рабочие цели:*\n"]
     for g in goals:
-        progress = db.get_goal_progress(g['id'])
-        pct = int(progress['done_tasks'] / max(progress['total_tasks'], 1) * 100)
-        bar = progress_bar(progress['done_tasks'], progress['total_tasks'], 8)
+        prog = db.get_goal_progress(g["id"])
+        pct = int(prog["done_tasks"] / max(prog["total_tasks"], 1) * 100)
+        emoji = g.get("emoji", "🎯")
         lines.append(
-            f"*{g['title']}*\n"
-            f"  {bar} {pct}% · {progress['done_tasks']}/{progress['total_tasks']} задач · {progress['hours_spent']}ч"
-        )
-    lines.append("\n💼 /life — жизненные цели (долги, путешествия, будущее)")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_life(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Жизненные цели: долги, покупки, путешествия, будущее"""
-    if not is_owner(update):
-        return
-    zones = db.get_life_goals()
-    meta = {
-        "debts":  ("🔥 ДОЛГИ",        "Свобода от кредитов"),
-        "goals":  ("🎯 ЦЕЛИ",          "Здоровье, покупки"),
-        "travel": ("✈️ ПУТЕШЕСТВИЯ",   "Копим на трипы"),
-        "future": ("💰 БУДУЩЕЕ",       "Подушка, пассивный доход"),
-        "wife":   ("💕 ЖЕНЕ",          "Ленка"),
-    }
-
-    lines = ["*Жизненные цели — зачем ты работаешь 4ч/день:*\n"]
-    total_remain = 0
-    for zone_key, (title, desc) in meta.items():
-        items = zones.get(zone_key, [])
-        if not items:
-            continue
-        total_target = sum(g.get("target_rub") or 0 for g in items)
-        total_paid = sum(g.get("paid_rub") or 0 for g in items)
-        total_mo = sum(g.get("monthly_rub") or 0 for g in items)
-        remain = max(total_target - total_paid, 0)
-        total_remain += remain
-        pct = int(total_paid / total_target * 100) if total_target > 0 else 0
-
-        lines.append(f"\n{title} · _{desc}_")
-        if total_target > 0:
-            bar = progress_bar(total_paid, total_target, 10)
-            lines.append(f"  {bar} {pct}%")
-            lines.append(f"  💵 {total_paid:,}₽ / {total_target:,}₽".replace(",", " "))
-            lines.append(f"  Осталось: *{remain:,}₽*".replace(",", " "))
-        if total_mo > 0:
-            lines.append(f"  📆 Ежемес: {total_mo:,}₽".replace(",", " "))
-
-    lines.append(f"\n━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"*Итого осталось: {total_remain:,}₽*".replace(",", " "))
-    lines.append(f"\n💳 /pay <id> <сумма> — внести платёж")
-    lines.append(f"📋 /zone <debts|goals|travel|future|wife> — детали зоны")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_zone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Детали конкретной зоны"""
-    if not is_owner(update):
-        return
-    if not context.args:
-        return await update.message.reply_text(
-            "Формат: `/zone debts|goals|travel|future|wife`", parse_mode="Markdown"
+            f"{emoji} <b>{g['title']}</b>\n"
+            f"   {progress_bar(prog['done_tasks'], prog['total_tasks'])} {pct}% "
+            f"({prog['done_tasks']}/{prog['total_tasks']} задач, {prog['hours_spent']}ч)\n"
         )
 
-    zone = context.args[0]
-    zones = db.get_life_goals()
-    items = zones.get(zone, [])
-    if not items:
-        return await update.message.reply_text(f"Зона '{zone}' пуста")
-
-    titles = {"debts": "🔥 Долги", "goals": "🎯 Цели", "travel": "✈️ Путешествия",
-              "future": "💰 Будущее", "wife": "💕 Жене"}
-    lines = [f"*{titles.get(zone, zone)}:*\n"]
-    for g in items:
-        emoji = g.get("emoji", "")
-        title = g.get("title")
-        target = g.get("target_rub") or 0
-        paid = g.get("paid_rub") or 0
-        mo = g.get("monthly_rub") or 0
-
-        if target > 0:
-            pct = int(paid / target * 100) if target else 0
-            bar = progress_bar(paid, target, 6)
-            lines.append(
-                f"`#{g['id']:>3d}` {emoji} *{title}*\n"
-                f"       {bar} {pct}% · {paid:,}/{target:,}₽".replace(",", " ")
-            )
-        elif mo > 0:
-            lines.append(f"`#{g['id']:>3d}` {emoji} *{title}* — {mo:,}₽/мес".replace(",", " "))
-
-    lines.append(f"\n💳 /pay <id> <сумма>")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Внести платёж: /pay <goal_id> <amount>"""
-    if not is_owner(update):
-        return
-    if len(context.args) < 2:
-        return await update.message.reply_text(
-            "Формат: `/pay <id_цели> <сумма>`\n"
-            "Пример: `/pay 7 5000` — внести 5000₽ на Сбербанк",
-            parse_mode="Markdown"
-        )
-    try:
-        goal_id = int(context.args[0])
-        amount = int(context.args[1])
-    except ValueError:
-        return await update.message.reply_text("Цифрами: `/pay 7 5000`", parse_mode="Markdown")
-
-    goal = db.get_goal(goal_id)
-    if not goal:
-        return await update.message.reply_text(f"Цель #{goal_id} не найдена")
-
-    new_paid = db.add_payment(goal_id, amount)
-    target = goal.get("target_rub") or 0
-    remain = max(target - new_paid, 0)
-    pct = int(new_paid / target * 100) if target else 0
-
-    msg = (
-        f"✅ *+{amount:,}₽ → {goal['emoji']} {goal['title']}*\n\n".replace(",", " ") +
-        f"Внесено: {new_paid:,}₽ / {target:,}₽ ({pct}%)\n".replace(",", " ") +
-        f"Осталось: *{remain:,}₽*".replace(",", " ")
-    )
-    if remain == 0 and target > 0:
-        msg += "\n\n🎉 *Цель закрыта!* 🔥"
-
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def cmd_addgoal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-    if not context.args:
-        return await update.message.reply_text(
-            "Формат: `/addgoal Название цели`\n"
-            "Пример: `/addgoal Закрыть 5 клиентов на pay-per-lead`",
-            parse_mode="Markdown"
-        )
-
-    title = " ".join(context.args)
-    gid = db.add_goal(title)
     await update.message.reply_text(
-        f"✅ Цель создана: *{title}*\n"
-        f"ID: {gid}\n\n"
-        f"Добавь задачи: `/add {gid} Название задачи | 60`\n"
-        f"(60 = оценка в минутах)",
-        parse_mode="Markdown"
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_KB,
     )
+
+
+# ═══════════════════════════════════════════
+# COMMAND: /debts
+# ═══════════════════════════════════════════
+
+async def cmd_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+
+    data = build_debts()
+    items = data["items"]
+
+    lines = ["💰 <b>Прогресс по долгам</b>\n"]
+
+    if not items:
+        lines.append("Долгов нет! Свобода!")
+    else:
+        for d in items:
+            target = d.get("target_rub") or 0
+            paid = d.get("paid_rub") or 0
+            remaining = d.get("remaining", 0)
+            pct = d.get("pct", 0)
+            emoji = d.get("emoji", "💳")
+            lines.append(
+                f"{emoji} <b>{d['title']}</b>\n"
+                f"   {progress_bar(paid, target)} {pct}%\n"
+                f"   Оплачено: {fmt_rub(paid)} / {fmt_rub(target)} (осталось: {fmt_rub(remaining)})\n"
+            )
+
+        lines.append(
+            f"<b>ИТОГО:</b> {fmt_rub(data['total_paid'])} / {fmt_rub(data['total_target'])} "
+            f"({data['pct']}%) | Осталось: {fmt_rub(data['total_remaining'])}"
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_KB,
+    )
+
+
+# ═══════════════════════════════════════════
+# COMMAND: /sales
+# ═══════════════════════════════════════════
+
+async def cmd_sales(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+
+    summary = db.get_sales_summary(30)
+    lines = ["📈 <b>Продажи за 30 дней</b>\n"]
+
+    if summary["total_clients"] == 0:
+        lines.append("Продаж пока нет.")
+    else:
+        lines.append(f"Клиентов: {summary['total_clients']}")
+        lines.append(f"Выручка: {fmt_rub(summary['total_revenue'])}")
+        lines.append(f"Расход: {fmt_rub(summary['total_cost'])}")
+        lines.append(f"Маржа: {fmt_rub(summary['total_margin'])}\n")
+
+        for pt, data in summary["by_product"].items():
+            name = db.PRODUCT_NAMES.get(pt, pt)
+            lines.append(f"  {name}: {data['count']} шт, маржа {fmt_rub(data['margin'])}")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_KB,
+    )
+
+
+# ═══════════════════════════════════════════
+# COMMAND: /add — conversation to add task
+# ═══════════════════════════════════════════
+
+ADD_TITLE, ADD_GOAL = range(2)
+
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Добавить задачу: /add <goal_id> Название | минуты"""
     if not is_owner(update):
-        return
-    if len(context.args) < 2:
-        return await update.message.reply_text(
-            "Формат: `/add <goal_id> Название задачи | 60`",
-            parse_mode="Markdown"
-        )
-
-    try:
-        goal_id = int(context.args[0])
-    except ValueError:
-        return await update.message.reply_text("Первый аргумент — ID цели (число)")
-
-    rest = " ".join(context.args[1:])
-    if "|" in rest:
-        title, est = rest.rsplit("|", 1)
-        title = title.strip()
-        estimate = int(est.strip())
-    else:
-        title = rest
-        estimate = 60
-
-    today = date.today().isoformat()
-    tid = db.add_task(goal_id, title, estimate, scheduled_date=today)
+        return ConversationHandler.END
     await update.message.reply_text(
-        f"✅ Задача добавлена: *{title}*\n"
-        f"⏱ Оценка: {fmt_minutes(estimate)} · Цель ID: {goal_id}",
-        parse_mode="Markdown"
+        "Введи название задачи:",
+        reply_markup=MAIN_KB,
     )
+    return ADD_TITLE
 
-async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать план на сегодня"""
-    if not is_owner(update):
-        return
 
-    today = date.today().isoformat()
-    tasks = db.get_tasks_for_date(today)
-    worked = db.get_today_minutes()
-    remaining = max(0, DAILY_BUDGET_MINUTES - worked)
-    active = db.get_active_timer()
-
-    lines = [
-        f"📋 *План на {date.today().strftime('%d.%m.%Y')}*\n",
-        f"⏱ {progress_bar(worked, DAILY_BUDGET_MINUTES, 12)} {fmt_minutes(worked)}/{fmt_minutes(DAILY_BUDGET_MINUTES)}",
-        f"Осталось: *{fmt_minutes(remaining)}*\n"
-    ]
-
-    if active:
-        elapsed = (datetime.now() - datetime.fromisoformat(active['started_at'])).total_seconds() / 60
-        lines.append(f"▶️ Сейчас: *{active['task_title']}* — {fmt_minutes(elapsed)}\n")
-
-    if not tasks:
-        lines.append("_Задач на сегодня нет. Добавь через /add или /schedule_")
-    else:
-        buttons = []
-        for t in tasks:
-            icon = "✅" if t['status'] == 'done' else "▶️" if t['status'] == 'in_progress' else "⬜"
-            goal_tag = f"[{t['goal_title']}]" if t.get('goal_title') else ""
-            lines.append(f"{icon} *{t['title']}* — {fmt_minutes(t['estimate_min'])} {goal_tag}")
-
-            if t['status'] == 'todo':
-                buttons.append([InlineKeyboardButton(
-                    f"▶️ {t['title'][:30]}", callback_data=f"start_{t['id']}"
-                )])
-            elif t['status'] == 'in_progress':
-                buttons.append([InlineKeyboardButton(
-                    f"⏹ Завершить: {t['title'][:25]}", callback_data=f"stop_{t['id']}"
-                )])
-
-        markup = InlineKeyboardMarkup(buttons) if buttons else None
-        return await update.message.reply_text(
-            "\n".join(lines), parse_mode="Markdown", reply_markup=markup
+async def add_title_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_task_title"] = update.message.text.strip()
+    goals = db.get_goals(goal_type="work")
+    if not goals:
+        # No goals — create task without goal
+        task_id = db.add_task(
+            goal_id=None,
+            title=context.user_data["new_task_title"],
+            estimate_min=60,
         )
+        db.schedule_task(task_id, today_str())
+        await update.message.reply_text(
+            f"✅ Задача создана: <b>{context.user_data['new_task_title']}</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=MAIN_KB,
+        )
+        return ConversationHandler.END
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запланировать незапланированные задачи на сегодня: /schedule"""
-    if not is_owner(update):
-        return
-
-    unscheduled = db.get_tasks_for_date(None)  # все todo без даты
-    if not unscheduled:
-        return await update.message.reply_text("Все задачи уже запланированы или выполнены.")
-
-    buttons = []
-    for t in unscheduled[:10]:
-        goal_tag = f"[{t['goal_title']}] " if t.get('goal_title') else ""
-        buttons.append([InlineKeyboardButton(
-            f"📅 {goal_tag}{t['title'][:30]} ({fmt_minutes(t['estimate_min'])})",
-            callback_data=f"sched_{t['id']}"
+    kb = []
+    for g in goals:
+        emoji = g.get("emoji", "🎯")
+        kb.append([InlineKeyboardButton(
+            f"{emoji} {g['title'][:40]}",
+            callback_data=f"addgoal_{g['id']}"
         )])
+    kb.append([InlineKeyboardButton("Без цели", callback_data="addgoal_0")])
 
     await update.message.reply_text(
-        "📅 *Выбери задачи на сегодня:*",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons)
+        "К какой цели привязать?",
+        reply_markup=InlineKeyboardMarkup(kb),
     )
+    return ADD_GOAL
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-    active = db.get_active_timer()
-    if not active:
-        return await update.message.reply_text("⏸ Таймер не запущен. Открой /plan и выбери задачу.")
 
-    elapsed = (datetime.now() - datetime.fromisoformat(active['started_at'])).total_seconds() / 60
-    await update.message.reply_text(
-        f"▶️ *{active['task_title']}*\n"
-        f"🎯 {active.get('goal_title', '—')}\n"
-        f"⏱ Идёт: *{fmt_minutes(elapsed)}*\n",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("⏹ Завершить", callback_data=f"stop_{active['task_id']}"),
-            InlineKeyboardButton("⏸ Пауза", callback_data=f"pause_{active['task_id']}")
-        ]])
+async def add_goal_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    goal_id_str = query.data.replace("addgoal_", "")
+    goal_id = int(goal_id_str) if goal_id_str != "0" else None
+    title = context.user_data.get("new_task_title", "Без названия")
+
+    task_id = db.add_task(goal_id=goal_id, title=title, estimate_min=60)
+    db.schedule_task(task_id, today_str())
+
+    goal_name = ""
+    if goal_id:
+        g = db.get_goal(goal_id)
+        if g:
+            goal_name = f" → {g.get('emoji', '🎯')} {g['title']}"
+
+    await query.edit_message_text(
+        f"✅ Задача создана: <b>{title}</b>{goal_name}\n"
+        f"Запланирована на сегодня.",
+        parse_mode=ParseMode.HTML,
     )
+    return ConversationHandler.END
+
+
+async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Отменено.", reply_markup=MAIN_KB)
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════
+# COMMAND: /stats
+# ═══════════════════════════════════════════
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
 
+    daily = db.get_daily_stats(30)
     streak = db.get_streak()
-    worked_today = db.get_today_minutes()
-    daily = db.get_daily_stats(7)
-    by_goal = db.get_time_by_goal(7)
+    xp = db.get_xp()
+    by_goal = db.get_time_by_goal(30)
+
+    total_days = len(daily)
+    total_min = sum(d["total_min"] for d in daily)
+    avg_min = total_min / max(total_days, 1)
+    full_days = sum(1 for d in daily if d["total_min"] >= DAILY_BUDGET_MINUTES)
 
     lines = [
-        "📊 *Статистика*\n",
-        f"🔥 Streak: *{streak} дней*",
-        f"⏱ Сегодня: *{fmt_minutes(worked_today)}* / {fmt_minutes(DAILY_BUDGET_MINUTES)}\n",
+        "📊 <b>Статистика за 30 дней</b>\n",
+        f"📅 Рабочих дней: {total_days}",
+        f"⏱ Всего: {fmt_minutes(total_min)}",
+        f"📈 Среднее/день: {fmt_minutes(avg_min)}",
+        f"🏆 Полных дней (4ч+): {full_days}",
+        f"🔥 Текущий стрик: {streak} дн.",
+        f"⭐ XP: {xp['total_xp']} (ур. {xp['level']})\n",
+        "<b>По целям:</b>",
     ]
-
-    if daily:
-        lines.append("*Последние 7 дней:*")
-        for d in daily[-7:]:
-            bar = progress_bar(d['total_min'], DAILY_BUDGET_MINUTES, 8)
-            lines.append(f"  {d['day'][5:]} {bar} {fmt_minutes(d['total_min'])}")
-
-    if by_goal:
-        lines.append("\n*По целям (7 дн):*")
-        for g in by_goal:
-            lines.append(f"  • {g['title']}: {fmt_minutes(g['total_min'])}")
-
-    lines.append(f"\n🌐 Подробнее: дашборд /web")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Детальный отчёт: куда ушли 4 часа сегодня"""
-    if not is_owner(update):
-        return
-
-    entries = db.get_today_breakdown()
-    by_goal = db.get_today_by_goal()
-    worked = db.get_today_minutes()
-    remaining = max(0, DAILY_BUDGET_MINUTES - worked)
-
-    lines = [
-        f"📊 *Сегодня · {date.today().strftime('%d.%m.%Y')}*\n",
-        f"⏱ {progress_bar(worked, DAILY_BUDGET_MINUTES, 14)} {fmt_minutes(worked)}",
-        f"Бюджет: {fmt_minutes(DAILY_BUDGET_MINUTES)} · Осталось: *{fmt_minutes(remaining)}*",
-    ]
-
-    if not entries:
-        lines.append("\n_Сегодня таймер ещё не запускался._\n/plan → выбери задачу")
-        return await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-    # Разбивка по целям
-    lines.append("\n*📍 Куда ушли часы:*")
     for g in by_goal:
-        pct = int(g["total_min"] / max(worked, 1) * 100)
-        bar = progress_bar(g["total_min"], worked, 10)
-        lines.append(f"\n{g['emoji']} *{g['title']}* — {fmt_minutes(g['total_min'])} ({pct}%)")
-        lines.append(f"  {bar}")
-        for t in g["tasks"]:
-            lines.append(f"  • {t['title']} — {fmt_minutes(t['min'])}")
-
-    # Timeline
-    lines.append("\n*⏰ Timeline:*")
-    for e in entries:
-        start = datetime.fromisoformat(e["started_at"]).strftime("%H:%M")
-        end = datetime.fromisoformat(e["ended_at"]).strftime("%H:%M") if e["ended_at"] else "сейчас"
-        tag = " ▶️" if e["active"] else ""
-        lines.append(
-            f"  `{start}–{end}` {e['goal_emoji']} {e['task_title'][:25]} · {fmt_minutes(e['duration_min'])}{tag}"
-        )
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_suggest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Умный план: авто-генерация задач + подбор по приоритету"""
-    if not is_owner(update):
-        return
-
-    today = date.today().isoformat()
-    already = db.get_tasks_for_date(today)
-
-    # Авто-генерация через engine
-    selected, total = autotasks.generate_daily_plan(DAILY_BUDGET_MINUTES)
-    tasks = db.get_tasks_for_date(today)
-    new_tasks = [t for t in tasks if t["id"] not in {a["id"] for a in already}]
-
-    if not tasks:
-        return await update.message.reply_text(
-            "🤔 Бэклог пуст. Добавь задачи: /add <goal_id> название | минуты"
-        )
-
-    total_est = sum(t["estimate_min"] for t in tasks if t["status"] != "done")
-    lines = [
-        "💡 *План на 4ч — подобран по приоритету:*\n",
-        "_Клиенты → деньги → долги → свобода_\n",
-    ]
-    buttons = []
-    for t in tasks:
-        if t["status"] == "done": continue
-        icon = "▶️" if t["status"] == "in_progress" else "⬜"
-        new = " 🆕" if t["id"] in {nt["id"] for nt in new_tasks} else ""
-        tag = f"[{t.get('goal_title', '')}]"
-        lines.append(f"  {icon} *{t['title']}*{new} · {fmt_minutes(t['estimate_min'])} {tag}")
-        if t["status"] == "todo":
-            buttons.append([InlineKeyboardButton(
-                f"▶️ {t['title'][:30]}", callback_data=f"start_{t['id']}"
-            )])
-
-    lines.append(f"\n⏱ Итого: *{fmt_minutes(total_est)}*")
-    if new_tasks:
-        lines.append(f"🆕 Авто-добавлено: {len(new_tasks)} задач")
+        emoji = g.get("emoji", "🎯")
+        lines.append(f"  {emoji} {g['title']}: {fmt_minutes(g['total_min'])}")
 
     await update.message.reply_text(
-        "\n".join(lines), parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons) if buttons else MAIN_KB,
-    )
-
-
-async def cmd_streak(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-    streak = db.get_streak()
-    if streak == 0:
-        msg = "🔥 Streak: 0 дней\nНачни прямо сейчас — /plan"
-    elif streak < 7:
-        msg = f"🔥 Streak: *{streak} дней*\nПродолжай! До недельного streak осталось {7-streak} дней"
-    else:
-        msg = f"🔥🔥🔥 Streak: *{streak} дней*\nМощно! Ты в потоке."
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Быстро завершить текущую задачу"""
-    if not is_owner(update):
-        return
-    duration = db.stop_active_timer()
-    if not duration:
-        return await update.message.reply_text("Нет активного таймера.")
-
-    worked = db.get_today_minutes()
-    remaining = max(0, DAILY_BUDGET_MINUTES - worked)
-
-    # Найти текущую задачу и завершить
-    sb = db.get_sb()
-    res = sb.table("tasks").select("id, title").eq("status", "in_progress").limit(1).execute()
-    if res.data:
-        task = res.data[0]
-        db.complete_task(task['id'])
-        task_title = task['title']
-    else:
-        task_title = "задача"
-
-    quote = motivation.get_done_quote()
-    msg = (
-        f"✅ *{task_title}* — готово за {fmt_minutes(duration)}!\n\n"
-        f"_{quote}_\n\n"
-        f"⏱ {progress_bar(worked, DAILY_BUDGET_MINUTES, 12)} {fmt_minutes(worked)}/{fmt_minutes(DAILY_BUDGET_MINUTES)}\n"
-        f"Осталось: *{fmt_minutes(remaining)}*"
-    )
-
-    # Пополняем бэклог если мало задач
-    autotasks.replenish_all(min_todo=2)
-
-    if remaining > 0:
-        today = date.today().isoformat()
-        next_tasks = [t for t in db.get_tasks_for_date(today) if t['status'] == 'todo' and t['estimate_min'] <= remaining]
-        if next_tasks:
-            t = next_tasks[0]
-            msg += f"\n\n➡️ Следующая: *{t['title']}* ({fmt_minutes(t['estimate_min'])})"
-            markup = InlineKeyboardMarkup([[
-                InlineKeyboardButton(f"▶️ Начать", callback_data=f"start_{t['id']}"),
-                InlineKeyboardButton("☕ Перерыв", callback_data="break")
-            ]])
-            return await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=markup)
-        else:
-            msg += "\n\n🎉 Все задачи на сегодня выполнены!"
-    else:
-        msg += "\n\n🎉 *4 часа отработаны! Отличный день!*"
-
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-
-# ===== FREE TEXT INPUT & QUICK STOP =====
-
-async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Обработка свободного текста:
-    - Стоп-слова → остановка таймера
-    - Любой другой текст → создание задачи + запуск таймера
-    - Ответ на пинг «Занят другим» → ожидание описания
-    """
-    if not is_owner(update):
-        return
-    text = update.message.text.strip()
-
-    # Проверяем: это кнопка reply-клавиатуры?
-    button_texts = {"📋 План на 4ч", "▶️ Статус", "✅ Завершить", "📊 Сегодня",
-                    "🎯 Работа", "💼 Жизнь", "🔥 Streak", "💡 Предложи план"}
-    if text in button_texts:
-        return  # Уже обработано handle_reply_button
-
-    text_lower = text.lower().strip()
-
-    # === QUICK STOP ===
-    if text_lower in STOP_WORDS:
-        active = db.get_active_timer()
-        if not active:
-            return await update.message.reply_text(
-                "⏸ Таймер не запущен. Нечего останавливать.\n"
-                "Напиши чем займёшься — запущу трек.",
-                reply_markup=MAIN_KB,
-            )
-        duration = db.stop_active_timer()
-        task_title = active.get('task_title', 'задача')
-        goal_title = active.get('goal_title', '')
-
-        # Помечаем задачу завершённой если стоп-слово = "готово"/"done"
-        if text_lower in {"готово", "done"}:
-            if active.get('task_id'):
-                db.complete_task(active['task_id'])
-
-        worked = db.get_today_minutes()
-        remaining = max(0, DAILY_BUDGET_MINUTES - worked)
-
-        goal_str = f" · {goal_title}" if goal_title else ""
-        status_icon = "✅" if text_lower in {"готово", "done"} else "⏸"
-        status_word = "Готово" if text_lower in {"готово", "done"} else "Пауза"
-
-        msg = (
-            f"{status_icon} *{status_word}: {task_title}*{goal_str}\n"
-            f"⏱ Отработано: *{fmt_minutes(duration)}*\n\n"
-            f"{progress_bar(worked, DAILY_BUDGET_MINUTES, 12)} {fmt_minutes(worked)}/{fmt_minutes(DAILY_BUDGET_MINUTES)}\n"
-            f"Осталось: *{fmt_minutes(remaining)}*"
-        )
-
-        if remaining > 0:
-            msg += "\n\n💬 Напиши чем займёшься дальше — запущу трек."
-        else:
-            msg += "\n\n🎉 *4 часа отработаны! Отличный день!*"
-
-        return await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=MAIN_KB)
-
-    # === Ожидание описания после «Занят другим» ===
-    if context.user_data.get("waiting_for_activity"):
-        context.user_data["waiting_for_activity"] = False
-        # Продолжаем — обрабатываем как свободный ввод ниже
-
-    # === FREE TEXT → создание задачи + запуск таймера ===
-
-    # Если уже есть активный таймер — предложить сначала остановить
-    active = db.get_active_timer()
-    if active:
-        elapsed = (datetime.now() - datetime.fromisoformat(active['started_at'])).total_seconds() / 60
-        return await update.message.reply_text(
-            f"⏱ Сейчас уже идёт таймер:\n"
-            f"▶️ *{active['task_title']}* — {fmt_minutes(elapsed)}\n\n"
-            f"Напиши «стоп» чтобы остановить, потом опиши новую задачу.",
-            parse_mode="Markdown",
-            reply_markup=MAIN_KB,
-        )
-
-    # Ограничим длину названия задачи
-    task_title = text[:100].strip()
-    if len(task_title) < 2:
-        return  # Слишком короткое — игнорируем
-
-    # Пытаемся найти подходящую цель
-    matched_goal = match_goal_by_text(task_title)
-
-    if matched_goal:
-        goal_id = matched_goal['id']
-        goal_title = matched_goal['title']
-    else:
-        # Если целей нет вообще — берём первую рабочую или создаём без цели
-        goals = db.get_goals(goal_type="work")
-        if goals:
-            # Берём первую (самый высокий приоритет)
-            goal_id = goals[0]['id']
-            goal_title = goals[0]['title']
-        else:
-            goal_id = None
-            goal_title = "Без цели"
-
-    # Создаём задачу на сегодня
-    today = date.today().isoformat()
-    if goal_id:
-        tid = db.add_task(goal_id, task_title, estimate_min=60, scheduled_date=today)
-    else:
-        # Fallback: нужен goal_id, создадим общую цель
-        gid = db.add_goal("Разное", description="Задачи без конкретной цели")
-        tid = db.add_task(gid, task_title, estimate_min=60, scheduled_date=today)
-        goal_title = "Разное"
-
-    # Запускаем таймер
-    db.start_timer(tid)
-
-    await update.message.reply_text(
-        f"⏱ *Запустил таймер:* {task_title} · _{goal_title}_\n\n"
-        f"Напиши «стоп» когда закончишь.",
-        parse_mode="Markdown",
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
         reply_markup=MAIN_KB,
     )
 
 
-# ===== CALLBACKS =====
+# ═══════════════════════════════════════════
+# COMMAND: /schedule
+# ═══════════════════════════════════════════
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+
+    schedule = db.get_schedule()
+    today_wd = date.today().weekday()
+
+    lines = ["📅 <b>Расписание недели</b>\n"]
+    for s in schedule:
+        wd = s.get("weekday", 0)
+        day_name = db.DAYS_RU[wd] if wd < len(db.DAYS_RU) else "?"
+        marker = " 👈" if wd == today_wd else ""
+        hours = s.get("hours", 4)
+        lines.append(f"<b>{day_name}</b>: {s.get('focus', '—')} ({hours}ч){marker}")
+
+    if not schedule:
+        lines.append("Расписание не настроено. Добавь через WebApp.")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_KB,
+    )
+
+
+# ═══════════════════════════════════════════
+# CALLBACK QUERIES
+# ═══════════════════════════════════════════
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    data = query.data
+    if not is_owner(update):
+        await query.answer("Нет доступа")
+        return
 
+    data = query.data
+    await query.answer()
+
+    # ── Start timer ──
     if data.startswith("start_"):
-        task_id = int(data.split("_")[1])
+        task_id = int(data.replace("start_", ""))
         task = db.get_task(task_id)
         if not task:
-            return await query.edit_message_text("Задача не найдена.")
+            await query.edit_message_text("Задача не найдена.")
+            return
 
+        # Stop any active timer first
+        db.stop_active_timer()
         db.start_timer(task_id)
+
+        emoji = task.get("goal_emoji", "🎯")
         await query.edit_message_text(
-            f"▶️ *Таймер запущен!*\n\n"
-            f"📌 {task['title']}\n"
-            f"🎯 {task.get('goal_title', '—')}\n"
-            f"⏱ Оценка: {fmt_minutes(task['estimate_min'])}\n\n"
-            f"Когда закончишь — напиши «стоп» или /done",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Готово", callback_data=f"stop_{task_id}"),
-                InlineKeyboardButton("⏸ Пауза", callback_data=f"pause_{task_id}")
-            ]])
+            f"🍅 <b>Помодорка запущена!</b>\n\n"
+            f"{emoji} {task['title']}\n"
+            f"⏱ 30 минут — фокус!\n\n"
+            f"Я напомню когда время выйдет.",
+            parse_mode=ParseMode.HTML,
         )
 
-    elif data.startswith("stop_"):
-        task_id = int(data.split("_")[1])
+    # ── Stop timer ──
+    elif data == "stop_timer":
+        duration = db.stop_active_timer()
+        xp_earned = 0
+        if duration >= 25:
+            pomo_count = max(int(duration // 30), 1)
+            xp_earned = pomo_count * db.XP_POMODORO
+            db.add_xp(xp_earned, "pomodoro")
+
+        text = f"⏹ Таймер остановлен. Работа: {fmt_minutes(duration)}"
+        if xp_earned:
+            text += f"\n⭐ +{xp_earned} XP за помодорку"
+
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+
+    # ── Complete task ──
+    elif data.startswith("done_"):
+        task_id = int(data.replace("done_", ""))
         duration = db.stop_active_timer()
         db.complete_task(task_id)
         task = db.get_task(task_id)
+        task_title = task["title"] if task else "Задача"
 
-        worked = db.get_today_minutes()
-        remaining = max(0, DAILY_BUDGET_MINUTES - worked)
+        xp_earned = db.XP_TASK_DONE
+        db.add_xp(db.XP_TASK_DONE, "task_done")
 
-        msg = (
-            f"✅ *{task['title'] if task else 'Задача'}* — готово за {fmt_minutes(duration)}!\n\n"
-            f"⏱ {fmt_minutes(worked)} / {fmt_minutes(DAILY_BUDGET_MINUTES)} · Осталось: {fmt_minutes(remaining)}"
-        )
+        if duration >= 25:
+            pomo_count = max(int(duration // 30), 1)
+            pomo_xp = pomo_count * db.XP_POMODORO
+            db.add_xp(pomo_xp, "pomodoro")
+            xp_earned += pomo_xp
 
-        if remaining > 0:
-            today = date.today().isoformat()
-            next_tasks = [t for t in db.get_tasks_for_date(today) if t['status'] == 'todo' and t['estimate_min'] <= remaining]
-            if next_tasks:
-                t = next_tasks[0]
-                msg += f"\n\n➡️ Следующая: *{t['title']}* ({fmt_minutes(t['estimate_min'])})"
-                markup = InlineKeyboardMarkup([[
-                    InlineKeyboardButton(f"▶️ Начать", callback_data=f"start_{t['id']}"),
-                    InlineKeyboardButton("⏸ Перерыв", callback_data="break")
-                ]])
-                return await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=markup)
+        bonus = 0
+        today_min = db.get_today_minutes()
+        if today_min >= DAILY_BUDGET_MINUTES:
+            bonus += db.XP_FULL_DAY
+        today_tasks = db.get_tasks_for_date(today_str())
+        if today_tasks and all(t["status"] == "done" for t in today_tasks):
+            bonus += db.XP_ALL_TASKS
+        if bonus:
+            db.add_xp(bonus, "bonus")
+            xp_earned += bonus
 
-        msg += "\n\n💬 Напиши чем займёшься дальше — запущу трек."
-        await query.edit_message_text(msg, parse_mode="Markdown")
+        xp = db.get_xp()
+        quote = motivation.get_done_quote()
 
-    elif data.startswith("pause_"):
-        duration = db.stop_active_timer()
-        await query.edit_message_text(
-            f"⏸ Пауза. Отработано: {fmt_minutes(duration)}\n"
-            f"Продолжить — /plan или напиши чем займёшься",
-            parse_mode="Markdown"
-        )
+        lines = [
+            f"✅ <b>{task_title}</b> — выполнена!",
+            f"⏱ Затрачено: {fmt_minutes(duration)}",
+            f"⭐ +{xp_earned} XP (всего: {xp['total_xp']}, ур. {xp['level']})",
+        ]
+        if bonus:
+            lines.append(f"🏆 Бонус: +{bonus} XP!")
+        lines.append(f"\n💬 {quote}")
 
-    elif data.startswith("sched_all_"):
-        ids = [int(x) for x in data.replace("sched_all_", "").split(",") if x]
-        today = date.today().isoformat()
-        for tid in ids:
-            db.schedule_task(tid, today)
-        await query.edit_message_text(
-            f"✅ *{len(ids)} задач запланированы на сегодня*\n\nЖми 📋 План на 4ч → начать",
-            parse_mode="Markdown"
-        )
+        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
-    elif data.startswith("sched_"):
-        task_id = int(data.split("_")[1])
-        today = date.today().isoformat()
-        db.schedule_task(task_id, today)
-        task = db.get_task(task_id)
-        await query.edit_message_text(
-            f"📅 *{task['title']}* запланирована на сегодня!",
-            parse_mode="Markdown"
-        )
+        if today_min >= DAILY_BUDGET_MINUTES:
+            await _send_4h_summary(context, update.effective_chat.id)
 
-    elif data == "break":
-        await query.edit_message_text(
-            "☕ Отдыхай! Когда будешь готов — напиши чем займёшься или /plan",
-            parse_mode="Markdown"
-        )
+    # ── Claim reward ──
+    elif data.startswith("claim_"):
+        reward_id = int(data.replace("claim_", ""))
+        success, message = db.claim_reward(reward_id)
+        xp = db.get_xp()
+        if success:
+            text = f"🎉 {message}\n⭐ Остаток: {xp['total_xp']} XP"
+        else:
+            text = f"❌ {message}"
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML)
 
-    elif data == "ping_ok":
-        await query.edit_message_text("👍 Работай! Пискну через 30 мин если ещё идёт.")
-
-    elif data == "ping_done":
-        # Callback: «Нет, закончил» из пинга
-        active = db.get_active_timer()
-        if active:
-            duration = db.stop_active_timer()
-            if active.get('task_id'):
-                db.complete_task(active['task_id'])
-            worked = db.get_today_minutes()
-            remaining = max(0, DAILY_BUDGET_MINUTES - worked)
+    # ── Auto plan ──
+    elif data == "autoplan":
+        tasks, total = autotasks.generate_daily_plan(DAILY_BUDGET_MINUTES)
+        if tasks:
             await query.edit_message_text(
-                f"✅ *{active.get('task_title', 'Задача')}* — готово за {fmt_minutes(duration)}!\n\n"
-                f"⏱ {fmt_minutes(worked)}/{fmt_minutes(DAILY_BUDGET_MINUTES)} · Осталось: {fmt_minutes(remaining)}\n\n"
-                f"💬 Напиши чем займёшься дальше.",
-                parse_mode="Markdown"
+                f"🤖 Сгенерировано {len(tasks)} задач на ~{fmt_minutes(total)}.\n"
+                "Жми /plan чтобы увидеть.",
+                parse_mode=ParseMode.HTML,
             )
         else:
-            await query.edit_message_text("Таймер уже остановлен.")
+            await query.edit_message_text("Не удалось подобрать задачи.")
 
-    elif data == "ping_other":
-        # Callback: «Занят другим» из пинга — остановить текущий таймер и ждать описание
+    # ── Pomodoro continue ──
+    elif data == "pomo_continue":
         active = db.get_active_timer()
         if active:
-            duration = db.stop_active_timer()
+            task_id = active["task_id"]
+            db.stop_active_timer()
+            db.start_timer(task_id)
+            task = db.get_task(task_id)
             await query.edit_message_text(
-                f"⏸ Остановил *{active.get('task_title', 'задачу')}* ({fmt_minutes(duration)})\n\n"
-                f"💬 Чем занят? Напиши — и я запущу трек.",
-                parse_mode="Markdown"
+                f"🍅 Продолжаем: <b>{task['title'] if task else '?'}</b>\n⏱ Ещё 30 минут!",
+                parse_mode=ParseMode.HTML,
             )
         else:
-            await query.edit_message_text(
-                "💬 Чем занят? Напиши — и я запущу трек.",
-                parse_mode="Markdown"
-            )
-        # Ставим флаг ожидания
-        context.user_data["waiting_for_activity"] = True
+            await query.edit_message_text("Нет активного таймера. /focus")
 
-    elif data == "show_plan":
-        # Фейковый update.message для вызова cmd_plan
-        await query.message.reply_text("Открываю план…")
-        fake_update = Update(update.update_id, message=query.message)
-        await cmd_plan(fake_update, context)
-
-    elif data == "suggest":
-        await query.message.reply_text("Подбираю план по приоритету…")
-        fake_update = Update(update.update_id, message=query.message)
-        await cmd_suggest(fake_update, context)
-
-
-# ===== MORNING NOTIFICATION =====
-
-async def send_morning_plan(context: ContextTypes.DEFAULT_TYPE):
-    """9:00 — план дня с авто-задачами + мотивационное фото"""
-    today = date.today().isoformat()
-    tasks = db.get_tasks_for_date(today)
-
-    if not tasks:
-        # Авто-генерация через engine
-        selected, total = autotasks.generate_daily_plan(DAILY_BUDGET_MINUTES)
-        tasks = db.get_tasks_for_date(today)
-
-    if not tasks:
-        return await context.bot.send_photo(
-            OWNER_ID,
-            photo=motivation.get_image("morning"),
-            caption="🌅 Доброе утро!\n\nЗадач нет — жми 💡 Предложи план\nИли просто напиши чем займёшься.",
-            reply_markup=MAIN_KB,
+    # ── Pomodoro switch task ──
+    elif data == "pomo_switch":
+        db.stop_active_timer()
+        tasks = db.get_tasks_for_date(today_str())
+        todo = [t for t in tasks if t["status"] in ("todo", "in_progress")]
+        if not todo:
+            await query.edit_message_text("Нет задач. /add")
+            return
+        kb = [[InlineKeyboardButton(
+            f"{t.get('goal_emoji', '🎯')} {t['title'][:40]}",
+            callback_data=f"start_{t['id']}"
+        )] for t in todo]
+        await query.edit_message_text(
+            "🔄 Выбери задачу:",
+            reply_markup=InlineKeyboardMarkup(kb),
         )
 
-    total_est = sum(t['estimate_min'] for t in tasks if t['status'] != 'done')
+    # ── Pomodoro break ──
+    elif data == "pomo_break":
+        db.stop_active_timer()
+        await query.edit_message_text(
+            "☕ Перерыв 5 минут. Встань, потянись, попей воды.\n"
+            "Потом жми /focus"
+        )
+
+
+# ═══════════════════════════════════════════
+# REPLY KEYBOARD HANDLER (text messages)
+# ═══════════════════════════════════════════
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+
+    text = update.message.text.strip()
+    dispatch = {
+        "📋 План": cmd_plan,
+        "▶ Фокус": cmd_focus,
+        "✅ Готово": cmd_done,
+        "🎁 Награды": cmd_rewards,
+        "🎯 Цели": cmd_goals,
+        "💰 Долги": cmd_debts,
+        "📈 Продажи": cmd_sales,
+        "📊 Статы": cmd_stats,
+    }
+    handler_fn = dispatch.get(text)
+    if handler_fn:
+        await handler_fn(update, context)
+
+
+# ═══════════════════════════════════════════
+# SCHEDULED JOBS
+# ═══════════════════════════════════════════
+
+async def morning_plan(context: ContextTypes.DEFAULT_TYPE):
+    """08:00 MSK — morning motivation + plan"""
+    logger.info("Running morning_plan job")
+
+    schedule = db.get_today_schedule()
+    weekday_idx = date.today().weekday()
+    day_name = db.DAYS_RU[weekday_idx]
+    focus_text = schedule.get("focus", "Свободный день")
+
+    # Auto-generate tasks if none scheduled
+    tasks = db.get_tasks_for_date(today_str())
+    if not tasks:
+        autotasks.generate_daily_plan(DAILY_BUDGET_MINUTES)
+        tasks = db.get_tasks_for_date(today_str())
+
     quote = motivation.get_morning_quote()
-    lines = [
-        f"🌅 *План на 4 часа*\n",
-        f"_{quote}_\n",
-        f"📋 {len(tasks)} задач · {fmt_minutes(total_est)}\n",
-    ]
-    buttons = []
-    for t in tasks:
-        if t['status'] == 'done': continue
-        goal_tag = f"[{t['goal_title']}]" if t.get('goal_title') else ""
-        lines.append(f"⬜ *{t['title']}* · {fmt_minutes(t['estimate_min'])} {goal_tag}")
-        buttons.append([InlineKeyboardButton(
-            f"▶️ {t['title'][:30]}", callback_data=f"start_{t['id']}"
-        )])
-    lines.append("\n💪 Погнали! Или просто напиши чем займёшься.")
-
-    await context.bot.send_photo(
-        OWNER_ID,
-        photo=motivation.get_image("morning"),
-        caption="\n".join(lines),
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons) if buttons else MAIN_KB,
-    )
-
-
-async def send_midday_check(context: ContextTypes.DEFAULT_TYPE):
-    """12:00 — если не начал работать, спросить"""
-    worked = db.get_today_minutes()
-    active = db.get_active_timer()
-
-    if active:
-        # Уже работает — спросить всё ли ок
-        elapsed = (datetime.now() - datetime.fromisoformat(active['started_at'])).total_seconds() / 60
-        await context.bot.send_message(
-            OWNER_ID,
-            f"☀️ *Полдень!* Таймер идёт: *{active['task_title']}* — {fmt_minutes(elapsed)}\n\n"
-            f"Сейчас работаешь? Над чем?",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Да, продолжаю", callback_data="ping_ok")],
-                [InlineKeyboardButton("⏹ Нет, закончил", callback_data="ping_done")],
-                [InlineKeyboardButton("🔄 Занят другим", callback_data="ping_other")],
-            ])
-        )
-        return
-
-    if worked >= 30:
-        return  # Уже поработал — не мешаем
-
-    today = date.today().isoformat()
-    tasks = db.get_tasks_for_date(today)
-    todo = [t for t in tasks if t['status'] == 'todo']
-
-    if not todo:
-        await context.bot.send_message(
-            OWNER_ID,
-            "☀️ *Полдень!* Таймер ещё не щёлкал.\n\n"
-            "Сейчас работаешь? Над чем?",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 Открыть план", callback_data="show_plan")],
-                [InlineKeyboardButton("🔄 Занят другим", callback_data="ping_other")],
-            ])
-        )
-        return
-
-    t = todo[0]
-    await context.bot.send_message(
-        OWNER_ID,
-        f"☀️ *Полдень!* Таймер ещё не щёлкал.\n\n"
-        f"Сейчас работаешь? Над чем?\n\n"
-        f"Предлагаю начать с *{t['title']}* ({fmt_minutes(t['estimate_min'])})",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"▶️ Начать: {t['title'][:25]}", callback_data=f"start_{t['id']}")],
-            [InlineKeyboardButton("📋 Весь план", callback_data="show_plan")],
-            [InlineKeyboardButton("🔄 Занят другим", callback_data="ping_other")],
-        ])
-    )
-
-
-async def send_afternoon_pulse(context: ContextTypes.DEFAULT_TYPE):
-    """15:00 — прогресс 4ч"""
-    worked = db.get_today_minutes()
-    active = db.get_active_timer()
-    if active:
-        return
-    remaining = max(0, DAILY_BUDGET_MINUTES - worked)
-    if remaining <= 15:
-        return
-    pct = int(worked / DAILY_BUDGET_MINUTES * 100)
-    bar = progress_bar(worked, DAILY_BUDGET_MINUTES, 12)
-    await context.bot.send_message(
-        OWNER_ID,
-        f"☕ *15:00 · Прогресс дня*\n\n"
-        f"{bar} {pct}%\n"
-        f"Поработал: {fmt_minutes(worked)} · Осталось: *{fmt_minutes(remaining)}*\n\n"
-        f"Пора продолжать? Напиши чем займёшься или выбери из плана.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 План", callback_data="show_plan"),
-             InlineKeyboardButton("💡 Предложи", callback_data="suggest")],
-            [InlineKeyboardButton("🔄 Занят другим", callback_data="ping_other")],
-        ])
-    )
-
-
-async def send_evening_summary(context: ContextTypes.DEFAULT_TYPE):
-    """21:00 — итог дня с фото + разбивка по целям + авто-пополнение бэклога"""
-    worked = db.get_today_minutes()
-    by_goal = db.get_today_by_goal()
     streak = db.get_streak()
+    xp = db.get_xp()
 
-    # Пополняем бэклог на завтра
-    added = autotasks.replenish_all(min_todo=3)
+    lines = [
+        f"☀️ <b>Доброе утро!</b>",
+        f"💬 {quote}\n",
+        f"📅 {day_name} — {focus_text}",
+        f"🔥 Стрик: {streak} дн. | ⭐ XP: {xp['total_xp']}\n",
+        f"<b>План на 4 часа:</b>",
+    ]
+    est_total = 0
+    for t in tasks:
+        emoji = t.get("goal_emoji", "🎯")
+        lines.append(f"  {emoji} {t['title']} ({fmt_minutes(t['estimate_min'])})")
+        est_total += t["estimate_min"]
+    lines.append(f"\nИтого: ~{fmt_minutes(est_total)}")
 
-    good_day = worked >= DAILY_BUDGET_MINUTES * 0.5
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶ Начать фокус", callback_data="pomo_switch")],
+        [InlineKeyboardButton("✏ Открыть WebApp", web_app=WebAppInfo(url=WEBAPP_URL))],
+    ])
 
-    if worked < 10:
-        quote = motivation.get_evening_quote(good=False)
-        return await context.bot.send_photo(
-            OWNER_ID,
-            photo=motivation.get_image("evening"),
-            caption=f"🌙 {quote}\n\nStreak: {streak}. Завтра — новый шанс.",
-            reply_markup=MAIN_KB,
+    photo = motivation.get_image("morning")
+    text = "\n".join(lines)
+    try:
+        await context.bot.send_photo(
+            chat_id=OWNER_ID, photo=photo, caption=text,
+            parse_mode=ParseMode.HTML, reply_markup=kb,
+        )
+    except Exception:
+        await context.bot.send_message(
+            chat_id=OWNER_ID, text=text,
+            parse_mode=ParseMode.HTML, reply_markup=kb,
         )
 
-    pct = int(worked / DAILY_BUDGET_MINUTES * 100)
+
+async def evening_summary(context: ContextTypes.DEFAULT_TYPE):
+    """21:00 MSK — daily summary"""
+    logger.info("Running evening_summary job")
+
+    summary = db.save_daily_summary()
+    mins = summary["focus_minutes"]
+    done = summary["tasks_done"]
+    total = summary["tasks_total"]
+    streak = summary["streak"]
+    xp = db.get_xp()
+
+    good_day = mins >= DAILY_BUDGET_MINUTES * 0.75
     quote = motivation.get_evening_quote(good=good_day)
 
     lines = [
-        f"🌙 *Итог дня · {date.today().strftime('%d.%m')}*\n",
-        f"⏱ {progress_bar(worked, DAILY_BUDGET_MINUTES, 14)} {pct}%",
-        f"Отработано: *{fmt_minutes(worked)}* · 🔥 {streak}\n",
-        f"_{quote}_",
+        f"🌙 <b>Итоги дня</b>\n",
+        f"⏱ Фокус: {fmt_minutes(mins)} / {fmt_minutes(DAILY_BUDGET_MINUTES)}",
+        f"   {progress_bar(mins, DAILY_BUDGET_MINUTES)} {int(mins / max(DAILY_BUDGET_MINUTES, 1) * 100)}%",
+        f"✅ Задач: {done}/{total}",
+        f"🔥 Стрик: {streak} дн.",
+        f"⭐ XP: {xp['total_xp']} (ур. {xp['level']})\n",
     ]
-    if by_goal:
-        lines.append("\n*📍 Куда ушли часы:*")
-        for g in by_goal:
-            lines.append(f"  {g['emoji']} {g['title']} — {fmt_minutes(g['total_min'])}")
 
-    if added:
-        lines.append(f"\n♻️ +{added} новых задач добавлено в бэклог на завтра")
+    # Debt progress
+    data = build_debts()
+    if data["items"]:
+        lines.append("<b>Долги:</b>")
+        for d in data["items"]:
+            target = d.get("target_rub") or 0
+            paid = d.get("paid_rub") or 0
+            pct = d.get("pct", 0)
+            emoji = d.get("emoji", "💳")
+            lines.append(f"  {emoji} {d['title']}: {progress_bar(paid, target, 8)} {pct}%")
+        lines.append(f"  Всего: {fmt_rub(data['total_paid'])} / {fmt_rub(data['total_target'])}")
+        lines.append("")
 
-    img = "day_complete" if worked >= DAILY_BUDGET_MINUTES else "evening"
-    await context.bot.send_photo(
-        OWNER_ID,
-        photo=motivation.get_image(img),
-        caption="\n".join(lines),
-        parse_mode="Markdown",
-        reply_markup=MAIN_KB,
-    )
+    lines.append(f"💬 {quote}")
+
+    photo = motivation.get_image("evening")
+    text = "\n".join(lines)
+    try:
+        await context.bot.send_photo(
+            chat_id=OWNER_ID, photo=photo, caption=text,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        await context.bot.send_message(
+            chat_id=OWNER_ID, text=text,
+            parse_mode=ParseMode.HTML,
+        )
 
 
-async def check_long_timer(context: ContextTypes.DEFAULT_TYPE):
-    """Каждые 30 мин: если таймер идёт > 90 мин — спросить"""
+async def check_pomodoro(context: ContextTypes.DEFAULT_TYPE):
+    """Every 30 sec — check if active timer exceeded 30 min"""
     active = db.get_active_timer()
     if not active:
         return
-    started = datetime.fromisoformat(active['started_at'])
-    elapsed = (datetime.now() - started).total_seconds() / 60
-    if elapsed < 90:
-        return
-    # Не пиналим слишком часто — проверяем флаг в bot_data
-    last_ping = context.bot_data.get("last_long_ping")
-    if last_ping and (datetime.now() - last_ping).total_seconds() < 1800:
-        return
-    context.bot_data["last_long_ping"] = datetime.now()
 
-    await context.bot.send_message(
-        OWNER_ID,
-        f"⏰ Таймер *{active['task_title']}* идёт уже *{fmt_minutes(elapsed)}*.\n\n"
-        f"Сейчас работаешь? Над чем?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Да, продолжаю", callback_data="ping_ok")],
-            [InlineKeyboardButton("⏹ Нет, закончил", callback_data="ping_done")],
-            [InlineKeyboardButton("🔄 Занят другим", callback_data="ping_other")],
+    started = datetime.fromisoformat(active["started_at"])
+    elapsed_sec = (datetime.now() - started).total_seconds()
+    elapsed_min = elapsed_sec / 60
+
+    # Only notify once per timer crossing 30min mark
+    notified_key = f"pomo_notified_{active['id']}"
+    if elapsed_min >= POMODORO_MIN and not context.bot_data.get(notified_key):
+        context.bot_data[notified_key] = True
+
+        # Award XP for completed pomodoro
+        db.add_xp(db.XP_POMODORO, "pomodoro")
+        xp = db.get_xp()
+        today_min = db.get_today_minutes()
+
+        task_title = active.get("task_title", "Задача")
+        text = (
+            f"🍅 <b>Помодорка завершена!</b>\n\n"
+            f"Задача: {task_title}\n"
+            f"⏱ {fmt_minutes(elapsed_min)}\n"
+            f"⭐ +{db.XP_POMODORO} XP (всего: {xp['total_xp']})\n"
+            f"📊 Сегодня: {fmt_minutes(today_min)} / {fmt_minutes(DAILY_BUDGET_MINUTES)}"
+        )
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶ Продолжить эту", callback_data="pomo_continue")],
+            [InlineKeyboardButton("🔄 Другая задача", callback_data="pomo_switch")],
+            [InlineKeyboardButton("☕ Перерыв 5мин", callback_data="pomo_break")],
+            [InlineKeyboardButton("✅ Завершить задачу", callback_data=f"done_{active['task_id']}")],
         ])
-    )
+
+        try:
+            await context.bot.send_message(
+                chat_id=OWNER_ID, text=text,
+                parse_mode=ParseMode.HTML, reply_markup=kb,
+            )
+        except Exception as e:
+            logger.error(f"Failed to send pomodoro notification: {e}")
 
 
-# ===== MAIN =====
+# ═══════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Commands
+    # ── Commands ──
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("goals", cmd_goals))
-    app.add_handler(CommandHandler("life", cmd_life))
-    app.add_handler(CommandHandler("zone", cmd_zone))
-    app.add_handler(CommandHandler("pay", cmd_pay))
-    app.add_handler(CommandHandler("addgoal", cmd_addgoal))
-    app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("plan", cmd_plan))
-    app.add_handler(CommandHandler("schedule", cmd_schedule))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("today", cmd_today))
-    app.add_handler(CommandHandler("suggest", cmd_suggest))
-    app.add_handler(CommandHandler("streak", cmd_streak))
+    app.add_handler(CommandHandler("focus", cmd_focus))
     app.add_handler(CommandHandler("done", cmd_done))
+    app.add_handler(CommandHandler("rewards", cmd_rewards))
+    app.add_handler(CommandHandler("goals", cmd_goals))
+    app.add_handler(CommandHandler("debts", cmd_debts))
+    app.add_handler(CommandHandler("sales", cmd_sales))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("schedule", cmd_schedule))
 
-    # Reply keyboard buttons (higher priority — group 0)
-    app.add_handler(MessageHandler(
-        filters.Regex(r'^(📋 План на 4ч|▶️ Статус|✅ Завершить|📊 Сегодня|🎯 Работа|💼 Жизнь|🔥 Streak|💡 Предложи план)$'),
-        handle_reply_button
-    ))
+    # ── /add conversation ──
+    add_conv = ConversationHandler(
+        entry_points=[CommandHandler("add", cmd_add)],
+        states={
+            ADD_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_title_received)],
+            ADD_GOAL: [CallbackQueryHandler(add_goal_selected, pattern=r"^addgoal_")],
+        },
+        fallbacks=[CommandHandler("cancel", add_cancel)],
+        conversation_timeout=120,
+    )
+    app.add_handler(add_conv)
 
-    # Free text handler (lower priority — group 1, registered LAST)
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        handle_free_text
-    ), group=1)
+    # ── Inline callbacks ──
+    app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # Callbacks
-    app.add_handler(CallbackQueryHandler(handle_callback))
+    # ── Reply keyboard text ──
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    # Регистрируем команды в меню TG (слева от поля ввода)
-    async def post_init(application: Application):
-        commands = [
-            BotCommand("plan",    "📋 План на 4ч"),
-            BotCommand("suggest", "💡 Умный план по приоритету"),
-            BotCommand("today",   "📊 Куда ушли часы сегодня"),
-            BotCommand("status",  "▶️ Текущий таймер"),
-            BotCommand("done",    "✅ Завершить задачу"),
-            BotCommand("goals",   "🎯 Рабочие цели"),
-            BotCommand("life",    "💼 Жизненные цели"),
-            BotCommand("zone",    "📋 Детали зоны (debts/goals/travel/future)"),
-            BotCommand("pay",     "💳 Внести платёж по цели"),
-            BotCommand("stats",   "📈 Статистика"),
-            BotCommand("streak",  "🔥 Серия дней"),
-            BotCommand("add",     "➕ Добавить задачу"),
-            BotCommand("addgoal", "➕ Добавить цель"),
-            BotCommand("start",   "🏠 Главное меню"),
-        ]
-        await application.bot.set_my_commands(commands)
-        # WebApp button слева от поля ввода (для локальной разработки — localhost)
-        # Для продакшена заменить на https://domain
-        try:
-            await application.bot.set_chat_menu_button(
-                menu_button=MenuButtonWebApp(
-                    text="📊 Tracker",
-                    web_app=WebAppInfo(url=WEBAPP_URL)
-                )
-            )
-        except Exception:
-            pass  # WebApp requires HTTPS in production
+    # ── Scheduled jobs ──
+    jq = app.job_queue
 
-    app.post_init = post_init
+    # Morning plan — 08:00 MSK
+    jq.run_daily(
+        morning_plan,
+        time=dtime(hour=8, minute=0, tzinfo=MSK),
+        name="morning_plan",
+    )
 
-    # Напоминания (по МСК)
-    if OWNER_ID:
-        from datetime import time as dtime
-        import pytz
-        tz = pytz.timezone("Europe/Moscow")
-        jq = app.job_queue
-        jq.run_daily(send_morning_plan,    time=dtime(9, 0,  tzinfo=tz))
-        jq.run_daily(send_midday_check,    time=dtime(12, 0, tzinfo=tz))
-        jq.run_daily(send_afternoon_pulse, time=dtime(15, 0, tzinfo=tz))
-        jq.run_daily(send_evening_summary, time=dtime(21, 0, tzinfo=tz))
-        jq.run_repeating(check_long_timer, interval=1800, first=1800)  # каждые 30 мин
+    # Evening summary — 21:00 MSK
+    jq.run_daily(
+        evening_summary,
+        time=dtime(hour=21, minute=0, tzinfo=MSK),
+        name="evening_summary",
+    )
 
-    logger.info("Trigger Tracker bot started!")
+    # Pomodoro checker — every 30 seconds
+    jq.run_repeating(
+        check_pomodoro,
+        interval=30,
+        first=10,
+        name="check_pomodoro",
+    )
+
+    logger.info("Фокус-Трекер v2 запущен!")
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()

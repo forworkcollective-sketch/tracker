@@ -1,86 +1,80 @@
 #!/bin/bash
-# ===========================================
-# Деплой Trigger Tracker на Timeweb VPS
-# Запусти: bash deploy.sh
-# ===========================================
-
 set -e
 
-# ---- НАСТРОЙКИ (заполни перед запуском) ----
-VPS_IP="YOUR_VPS_IP"
-VPS_USER="YOUR_USER"
-REMOTE_DIR="/opt/tracker"
-SERVICE_NAME="tracker"
-# --------------------------------------------
+echo "=== TRACKER DEPLOY ==="
 
-# Проверка что настройки заполнены
-if [[ "$VPS_IP" == "YOUR_VPS_IP" || "$VPS_USER" == "YOUR_USER" ]]; then
-    echo "Заполни VPS_IP и VPS_USER в начале deploy.sh"
-    exit 1
-fi
+# 1. System packages
+apt update && apt install -y python3.11 python3.11-venv python3-pip nginx git
 
-SSH_TARGET="${VPS_USER}@${VPS_IP}"
-LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
+# 2. Clone repo
+rm -rf /opt/tracker
+git clone https://github.com/forworkcollective-sketch/tracker.git /opt/tracker
+cd /opt/tracker
 
-echo "Deploying Trigger Tracker to ${SSH_TARGET}..."
-echo ""
+# 3. Create .env
+cat > /opt/tracker/.env << 'ENVEOF'
+TRACKER_BOT_TOKEN=8395295166:AAGSH2UnkwFr4QxjJseW0sh7HX8WpguuqcM
+TRACKER_OWNER_ID=584623208
+SUPABASE_URL=https://hwdnbfzbnwutqctqqdpm.supabase.co
+SUPABASE_KEY=sb_secret_IOexrj1UyBsv6tjr5VlZ_g_AC4PDciR
+WEB_PORT=8099
+ENVEOF
 
-# --- 1. Копируем файлы на VPS ---
-echo "[1/5] Копирую файлы на VPS..."
-rsync -avz --delete \
-    --exclude 'venv/' \
-    --exclude '__pycache__/' \
-    --exclude '.env' \
-    --exclude '*.pyc' \
-    --exclude '.git/' \
-    "$LOCAL_DIR/" "${SSH_TARGET}:${REMOTE_DIR}/"
+# 4. Python venv + deps
+python3.11 -m venv /opt/tracker/venv
+/opt/tracker/venv/bin/pip install --upgrade pip
+/opt/tracker/venv/bin/pip install -r /opt/tracker/requirements.txt
+/opt/tracker/venv/bin/pip install python-dotenv
 
-# --- 2. Копируем .env ---
-echo "[2/5] Копирую .env..."
-if [ -f "$LOCAL_DIR/.env" ]; then
-    scp "$LOCAL_DIR/.env" "${SSH_TARGET}:${REMOTE_DIR}/.env"
-else
-    echo "  .env не найден локально, пропускаю"
-fi
+# 5. Systemd service
+cat > /etc/systemd/system/tracker.service << 'SVCEOF'
+[Unit]
+Description=Trigger Tracker Bot + Web
+After=network.target
 
-# --- 3. Устанавливаем зависимости в venv на VPS ---
-echo "[3/5] Создаю venv и ставлю зависимости..."
-ssh "$SSH_TARGET" bash -s <<REMOTE
-set -e
-cd ${REMOTE_DIR}
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/tracker
+EnvironmentFile=/opt/tracker/.env
+ExecStart=/opt/tracker/venv/bin/python run.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tracker
 
-# Создаём venv если нет
-if [ ! -d venv ]; then
-    python3.11 -m venv venv || python3 -m venv venv
-fi
+[Install]
+WantedBy=multi-user.target
+SVCEOF
 
-source venv/bin/activate
-pip install --upgrade pip -q
-pip install -r requirements.txt -q
+systemctl daemon-reload
+systemctl enable tracker
+systemctl start tracker
 
-echo "  Зависимости установлены"
-REMOTE
+# 6. Nginx reverse proxy
+cat > /etc/nginx/sites-available/tracker << 'NGXEOF'
+server {
+    listen 80;
+    server_name 72.56.5.173;
 
-# --- 4. Устанавливаем systemd сервис ---
-echo "[4/5] Настраиваю systemd сервис..."
-ssh "$SSH_TARGET" bash -s <<REMOTE
-set -e
+    location / {
+        proxy_pass http://127.0.0.1:8099;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+NGXEOF
 
-# Подставляем юзера в service-файл и копируем
-sed "s/YOUR_USER/${VPS_USER}/g" ${REMOTE_DIR}/tracker.service | sudo tee /etc/systemd/system/${SERVICE_NAME}.service > /dev/null
+ln -sf /etc/nginx/sites-available/tracker /etc/nginx/sites-enabled/
+rm -f /etc/nginx/sites-enabled/default
+nginx -t && systemctl restart nginx
 
-sudo systemctl daemon-reload
-sudo systemctl enable ${SERVICE_NAME}
-echo "  Сервис зарегистрирован"
-REMOTE
-
-# --- 5. Перезапускаем сервис ---
-echo "[5/5] Перезапускаю сервис..."
-ssh "$SSH_TARGET" "sudo systemctl restart ${SERVICE_NAME}"
-
-echo ""
-echo "Done! Trigger Tracker запущен на ${VPS_IP}"
-echo ""
-echo "  Дашборд:  http://${VPS_IP}:8099"
-echo "  Статус:   ssh ${SSH_TARGET} 'sudo systemctl status ${SERVICE_NAME}'"
-echo "  Логи:     ssh ${SSH_TARGET} 'journalctl -u ${SERVICE_NAME} -f'"
+echo "=== DEPLOY DONE ==="
+echo "Web: http://72.56.5.173"
+echo "Check: systemctl status tracker"
